@@ -8,14 +8,15 @@ No GUI, no window manager, no click-dragging. The entire interface is natural la
 
 ```
                           ┌─────────────────┐
-                          │    Whisper       │
-                          │  (ear, CPU/NPU)  │
+                          │  Whisper v3     │
+                          │  turbo (NPU)   │
                           └────────┬────────┘
                                    │ transcription
                           ┌────────▼────────┐
                           │   NPU Sentinel  │
-                          │  ~1-2B dense    │
+                          │  Qwen3-0.6B    │
                           │  always-on PID1 │
+                          │  XDNA 2 / FLM  │
                           └──┬─────────┬────┘
                  direct verb │         │ escalate
             ┌────────────────┘         └──────────────┐
@@ -38,15 +39,15 @@ No GUI, no window manager, no click-dragging. The entire interface is natural la
 
 ### The Three Tiers
 
-| Tier | Model | Hardware | Role | Latency |
-|------|-------|----------|------|---------|
-| **Sentinel** | ~1-2B dense (Qwen3-0.6B) | NPU (XDNA 2) / CPU fallback | Parse input → verbs, direct commands, display, routing | <50ms |
-| **Shell** | 4B/8B dense Q5/Q6 | GPU (Vulkan, 890M) | Tool-call chains, file ops, multi-step tasks | ~200ms prefill |
-| **Brain** | 30B-A3B MoE Q3_K_M | GPU (Vulkan, 890M) | Reasoning, composition, ambiguity | ~41 tok/s gen |
+| Tier | Model | Hardware | Runtime | Role | Latency |
+|------|-------|----------|---------|------|---------|
+| **Sentinel** | Qwen3-0.6B | XDNA 2 NPU | FLM :52625 | Parse input → verbs, direct commands, display, routing | <50ms |
+| **Shell** | 4B/8B dense Q5/Q6 | Radeon 890M | llama.cpp Vulkan :8090 | Tool-call chains, file ops, multi-step tasks | ~200ms prefill |
+| **Brain** | 30B-A3B MoE Q3_K_M | Radeon 890M | llama.cpp Vulkan :8090 | Reasoning, composition, ambiguity | ~41 tok/s gen |
 
 ### Why Three Tiers
 
-The sentinel is the kernel. It never sleeps, it owns the mic, it owns the display verbs, it owns the conversation state. 90% of OS commands — "open that file," "disk usage," "play music," "what time is it" — are trivially parseable. A 1-2B model classifies and dispatches those without ever waking the GPU.
+The sentinel is the kernel. It never sleeps, it owns the mic, it owns the display verbs, it owns the conversation state. 90% of OS commands — "open that file," "disk usage," "play music," "what time is it" — are trivially parseable. A 0.6B model on the NPU classifies and dispatches those without ever waking the GPU.
 
 The GPU models are workers the sentinel spawns on demand:
 - **Shell** for anything that needs tool-call chains (read → process → write)
@@ -71,27 +72,35 @@ notify       — transient toast notification
 
 ### Tool Calls
 
-All tiers emit tool calls through JSON schema constraints (GBNF grammar in llama.cpp). At low quant on small active-param MoE, unconstrained JSON generation has unacceptable malformation rates. Grammar enforcement is free and non-negotiable.
+GPU tiers emit tool calls through JSON schema constraints (GBNF grammar in llama.cpp). NPU sentinel uses FLM's Ollama-compatible API with `format: json` where supported. Grammar enforcement is free and non-negotiable on the GPU tiers.
 
 ## Hardware Target
 
-AMD Ryzen AI 9 HX 370 (GPD Pocket 4):
-- **NPU**: XDNA 2 (aie2p) — sentinel tier. Driver mainlined 6.14+, inference stack (ONNX RT XDNA EP) maturing. CPU fallback until ready.
-- **GPU**: Radeon 890M (gfx1150) — shell + brain tiers via Vulkan compute. ~17.3 GB GTT ceiling.
-- **CPU**: Zen 5, 12 cores — Whisper STT + Piper/Kokoro TTS. No GPU contention.
-- **RAM**: 32GB DDR5-5600 shared across all three processors.
+AMD Ryzen AI 9 HX 370 (GPD Pocket 4) — all three processors active:
 
-Both shell (4B Q6 ~4GB) and brain (30B Q3 ~14GB) can potentially co-reside in GTT (~17.3GB ceiling), loaded/unloaded by the sentinel based on demand.
+| Processor | Silicon | Role | Runtime |
+|-----------|---------|------|---------|
+| **NPU** | XDNA 2 (aie2p) | Sentinel + Whisper STT | FLM v0.9.43 |
+| **GPU** | Radeon 890M (gfx1150) | Shell + Brain LLM inference | llama.cpp Vulkan |
+| **CPU** | Zen 5, 12 cores | Piper/Kokoro TTS | native |
+| **RAM** | 32GB DDR5-5600 | Shared across all three | — |
+
+NPU stack verified operational: `amdxdna` v0.10 in-tree, XRT 2.21.75, FLM validated, `/dev/accel/accel0` present. No ONNX Runtime needed — FLM is the NPU inference runtime with an Ollama-compatible API.
+
+Both shell (4B Q6 ~4GB) and brain (30B Q3 ~14GB) can potentially co-reside in GPU GTT (~17.3GB ceiling), loaded/unloaded by the sentinel based on demand.
 
 ## Status
 
-Concept stage. The Signal bridge (tool-calling LLM agent via Signal) already proves the core inference-loop-as-shell pattern works with 6 tools.
+NPU stack verified. First sentinel bringup in progress.
 
-**Next steps:**
-1. Benchmark Qwen3-4B dense Q6 on Vulkan — prefill tok/s at 4k/8k context
-2. Run 50 structured tool calls, measure JSON malformation rate
-3. Prototype sentinel with Qwen3-0.6B on CPU (NPU parked until ONNX RT EP lands)
-4. Define the display verb schema and build a minimal renderer
+- [x] Concept + architecture designed
+- [x] NPU stack verified operational (amdxdna, XRT, FLM)
+- [ ] Pull sentinel model + Whisper on NPU
+- [ ] First sentinel loop (parse → verb → display)
+- [ ] Benchmark GPU shell tier (4B dense Q6 prefill + tool-call accuracy)
+- [ ] Define display verb JSON schema
+- [ ] Build minimal renderer
+- [ ] Voice loop integration (Whisper → sentinel → Piper)
 
 ## License
 
