@@ -91,16 +91,57 @@ Both shell (4B Q6 ~4GB) and brain (30B Q3 ~14GB) can potentially co-reside in GP
 
 ## Status
 
-NPU stack verified. First sentinel bringup in progress.
+NPU sentinel live. Qwen3-1.7B parses commands at 93% verb accuracy, ~1.4s round-trip.
 
 - [x] Concept + architecture designed
 - [x] NPU stack verified operational (amdxdna, XRT, FLM)
-- [ ] Pull sentinel model + Whisper on NPU
-- [ ] First sentinel loop (parse → verb → display)
+- [x] Sentinel model pulled + prompt engineered (93% accuracy, 100% valid JSON)
+- [x] CLI parser: `python3 sentinel.py "your command"`
+- [ ] Pull Whisper-v3-turbo on NPU for STT
 - [ ] Benchmark GPU shell tier (4B dense Q6 prefill + tool-call accuracy)
 - [ ] Define display verb JSON schema
 - [ ] Build minimal renderer
 - [ ] Voice loop integration (Whisper → sentinel → Piper)
+- [ ] Wire sentinel → GPU escalation path
+
+## Roadmap
+
+### Speculative Escalation
+
+When the mic VAD fires, start prefilling the 30B's KV cache on the GPU with session context — before the sentinel decides whether to escalate. If it doesn't escalate, discard. If it does, the KV cache is already warm. Hides most escalation latency behind STT time.
+
+### Entropy-Based Routing
+
+Replace hardcoded verb heuristics with logprob entropy from the sentinel's output distribution. Low confidence on the verb token → automatic escalation. High confidence → execute. The model tells you when it's unsure without needing explicit "escalate" classification. Calibrate the threshold from logged corrections over time.
+
+### Overnight Self-Distillation
+
+Every escalation where the 30B corrects the sentinel's parse is a training pair. Run nightly LoRA fine-tuning on the NPU model using accumulated correction data. The OS converges on its user's vocabulary — escalation rate decays week over week. No cloud OS can do this.
+
+### KV Cache as Page Cache
+
+Persist per-conversation KV caches to disk (mmap'd), LRU-evicted like a traditional page cache. "Reopening" a previous task is a page-in, not a full re-prefill. Based on Prompt Cache / RadixAttention research.
+
+### Token-Boundary Preemption
+
+GPU decode is interruptible at every token boundary — checkpoint KV state, service the sentinel's interrupt, resume. Real priority scheduling for inference. The sentinel can preempt a long brain-tier generation to handle a quick command, then resume.
+
+### Rust FSM as PID 1
+
+Actual PID 1 should be a ~200-line deterministic Rust state machine, not the LLM. The sentinel is a respawnable child process. Never give a stochastic process init's unkillability. The FSM handles process lifecycle, signal routing, and watchdog — the sentinel handles language.
+
+### Intent Provenance
+
+Every state change records the utterance that caused it in the OS journal. Semantic undo ("undo what I did to the config yesterday") and session replay fall out for free. The journal tracks *why*, not just *what*.
+
+### Prior Art
+
+- [MemGPT](https://memgpt.ai/) — OS-metaphor context paging
+- [AIOS](https://github.com/agiresearch/AIOS) (Rutgers) — LLM-agent OS kernel
+- [PowerInfer-2](https://arxiv.org/abs/2406.06282) — heterogeneous NPU/GPU inference on phones
+- [SGLang RadixAttention](https://arxiv.org/abs/2312.07104) — KV cache reuse
+- [Gifford's Semantic File Systems](https://dl.acm.org/doi/10.1145/121132.121138) (1991) — content-addressable storage
+- Karpathy's LLM-OS sketch — the conceptual ancestor
 
 ## License
 
