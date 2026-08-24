@@ -44,7 +44,7 @@ def parse_command(user_input: str, system_prompt: str) -> dict:
         "model": MODEL,
         "messages": [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"{user_input} /no_think"},
+            {"role": "user", "content": user_input},
         ],
         "stream": False,
         "options": {"num_predict": 100, "temperature": 0},
