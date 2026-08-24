@@ -1,8 +1,8 @@
 # LLMINUX — Hybridized Edition
 
-Linux where the LLM is the shell. Three-tier hybrid inference — NPU sentinel, GPU shell, GPU brain.
+A full LLM-based Linux operating system. The machine is the user's digital body.
 
-No GUI, no window manager, no click-dragging. The entire interface is natural language — voice or text — routed through a tiny always-on NPU model that parses commands into structured verbs and escalates to heavier models only when it needs to think.
+Not a shell replacement — LLMINUX replaces the entire userspace above the Linux kernel. It boots into an inference loop that owns the screen, the mic, the speakers, the webcam, and every peripheral. Three-tier hybrid inference across NPU, GPU, and CPU. The sentinel is the kernel, the display verbs are the compositor, the peripherals are its senses.
 
 ## Architecture
 
@@ -41,9 +41,9 @@ No GUI, no window manager, no click-dragging. The entire interface is natural la
 
 | Tier | Model | Hardware | Runtime | Role | Latency |
 |------|-------|----------|---------|------|---------|
-| **Sentinel** | Qwen3-0.6B | XDNA 2 NPU | FLM :52625 | Parse input → verbs, direct commands, display, routing | <50ms |
+| **Sentinel** | Qwen3-1.7B | XDNA 2 NPU | FLM :52625 | Parse input → verbs, direct commands, display, routing | ~1.4s |
 | **Shell** | 4B/8B dense Q5/Q6 | Radeon 890M | llama.cpp Vulkan :8090 | Tool-call chains, file ops, multi-step tasks | ~200ms prefill |
-| **Brain** | 30B-A3B MoE Q3_K_M | Radeon 890M | llama.cpp Vulkan :8090 | Reasoning, composition, ambiguity | ~41 tok/s gen |
+| **Brain** | Qwen3.6-35B-A3B MoE | Radeon 890M | llama.cpp Vulkan :8090 | Reasoning, composition, ambiguity | ≥41 tok/s gen |
 
 ### Why Three Tiers
 
@@ -81,28 +81,50 @@ AMD Ryzen AI 9 HX 370 (GPD Pocket 4) — all three processors active:
 | Processor | Silicon | Role | Runtime |
 |-----------|---------|------|---------|
 | **NPU** | XDNA 2 (aie2p) | Sentinel + Whisper STT | FLM v0.9.43 |
-| **GPU** | Radeon 890M (gfx1150) | Shell + Brain LLM inference | llama.cpp Vulkan |
-| **CPU** | Zen 5, 12 cores | Piper/Kokoro TTS | native |
+| **GPU** | Radeon 890M (gfx1150) | Brain + VLM (swappable) | llama.cpp Vulkan |
+| **CPU** | Zen 5, 12 cores | YOLO26 + Kokoro TTS + VAD | native / ONNX |
 | **RAM** | 32GB DDR5-5600 | Shared across all three | — |
 
-NPU stack verified operational: `amdxdna` v0.10 in-tree, XRT 2.21.75, FLM validated, `/dev/accel/accel0` present. No ONNX Runtime needed — FLM is the NPU inference runtime with an Ollama-compatible API.
+NPU stack verified operational: `amdxdna` v0.10 in-tree, XRT 2.21.75, FLM validated. All three processors run concurrent sense models within 32GB.
 
-Both shell (4B Q6 ~4GB) and brain (30B Q3 ~14GB) can potentially co-reside in GPU GTT (~17.3GB ceiling), loaded/unloaded by the sentinel based on demand.
+## Sense Model Matrix
+
+The OS owns every peripheral — they are its senses, not accessories.
+
+| Sense | Model | Hardware | Size | Notes |
+|-------|-------|----------|------|-------|
+| **Eyes (heavy VLM)** | Qwen3-VL-8B-Instruct Q4_K_M | GPU Vulkan | ~5GB | Best local VLM 2026. Swaps with brain on GPU |
+| **Eyes (always-on)** | YOLO26-N | CPU ONNX | 2.4M params | Real-time person/object detect, gates VLM |
+| **Ears (STT)** | whisper-v3:turbo | NPU (FLM) | 809M | 6x faster than large-v3 |
+| **Ears (wake word)** | openWakeWord + Silero VAD | CPU | <10MB | Custom "hey llminux", gates Whisper |
+| **Ears (who)** | wespeaker ECAPA-TDNN512-LM | CPU ONNX | ~6M | Speaker identification |
+| **Voice (system)** | Kokoro-82M | CPU ONNX | 82M | Faster-than-real-time, TTS Arena winner |
+| **Voice (persona)** | CosyVoice3/Coppage | CPU | 500M | Voice cloning for personality |
+| **Sentinel** | Qwen3-1.7B | NPU (FLM) | 1.6GB | 93% verb accuracy, 100% valid JSON |
+| **Brain** | Qwen3.6-35B-A3B MoE | GPU Vulkan | ~15-16GB Q3_K_M | Successor to 30B-A3B, MTP heads in llama.cpp |
+| **Proprioception** | IIO accel/gyro, ambient light, BT RSSI, ARP, thermal | CPU daemons | — | No ML needed — plain sensors |
+
+**Contention map:** NPU = Whisper STT, GPU = brain + VLM (swap), CPU = YOLO26 + Kokoro + VAD. All concurrent.
 
 ## Status
 
-NPU sentinel live. Qwen3-1.7B parses commands at 93% verb accuracy, ~1.4s round-trip.
+NPU sentinel live. Rust executor operational. Escalation wired. Sense models identified.
 
 - [x] Concept + architecture designed
 - [x] NPU stack verified operational (amdxdna, XRT, FLM)
 - [x] Sentinel model pulled + prompt engineered (93% accuracy, 100% valid JSON)
-- [x] CLI parser: `python3 sentinel.py "your command"`
-- [ ] Pull Whisper-v3-turbo on NPU for STT
-- [ ] Benchmark GPU shell tier (4B dense Q6 prefill + tool-call accuracy)
-- [ ] Define display verb JSON schema
-- [ ] Build minimal renderer
-- [ ] Voice loop integration (Whisper → sentinel → Piper)
-- [ ] Wire sentinel → GPU escalation path
+- [x] Rust executor — verbs have consequences (open_file, list_dir, disk_usage, run_command, escalate)
+- [x] Escalation wired to 30B MoE brain tier
+- [x] Sense model matrix researched and selected
+- [ ] Smithay compositor on spare TTY (owns the screen)
+- [ ] Verbs become Wayland surfaces (mpv, browser as verb targets)
+- [ ] Boot ownership — llminux.service on tty1, replace SDDM
+- [ ] Upgrade brain to Qwen3.6-35B-A3B (MTP heads, successor model)
+- [ ] Pull Whisper-v3-turbo + openWakeWord + Silero VAD (hearing)
+- [ ] Pull Qwen3-VL-8B + YOLO26-N (vision)
+- [ ] Kokoro-82M TTS integration (voice)
+- [ ] Speaker ID (wespeaker ECAPA)
+- [ ] Proprioceptive daemons (accel, light, BT, thermal)
 
 ## Roadmap
 
