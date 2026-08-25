@@ -56,7 +56,7 @@ DAYS = {"Mon": "Monday", "Tue": "Tuesday", "Wed": "Wednesday", "Thu": "Thursday"
         "Fri": "Friday", "Sat": "Saturday", "Sun": "Sunday"}
 
 
-ONES = ["", "one", "two", "three", "four", "five", "six", "seven",
+ONES = ["zero", "one", "two", "three", "four", "five", "six", "seven",
         "eight", "nine", "ten", "eleven", "twelve", "thirteen", "fourteen",
         "fifteen", "sixteen", "seventeen", "eighteen", "nineteen"]
 TENS = ["", "", "twenty", "thirty", "forty", "fifty"]
@@ -94,18 +94,16 @@ def speakable(text):
         hour = int(m.group(4))
         minute = int(m.group(5))
         ampm = m.group(6) or ""
-        if not ampm:
-            ampm = "AM" if hour < 12 else "PM"
-            if hour > 12: hour -= 12
-            if hour == 0: hour = 12
+        if ampm == "PM" and hour != 12:
+            hour += 12
+        elif ampm == "AM" and hour == 12:
+            hour = 0
         hour_w = num_to_words(hour)
+        min_w = num_to_words(minute) if minute >= 10 else "oh " + num_to_words(minute)
         if minute == 0:
-            time_str = f"{hour_w} {ampm}"
+            time_str = f"{hour_w} hundred"
         else:
-            min_w = num_to_words(minute)
-            if minute < 10:
-                min_w = "oh " + min_w
-            time_str = f"{hour_w} {min_w} {ampm}"
+            time_str = f"{hour_w} {min_w}"
         date_w = ordinal(date_n)
         return f"It's {time_str} on {day}, {month} {date_w}."
     s = re.sub(r"\b(\d+)%", lambda m: num_to_words(int(m.group(1))) + " percent", s)
