@@ -116,14 +116,16 @@ NPU sentinel live. Rust executor operational. Escalation wired. Sense models ide
 - [x] Rust executor — verbs have consequences (open_file, list_dir, disk_usage, run_command, escalate)
 - [x] Escalation wired to 30B MoE brain tier
 - [x] Sense model matrix researched and selected
+- [ ] Pull Whisper-v3-turbo + Silero VAD + openWakeWord (hearing)
+- [ ] Wire ear pipeline: VAD → wake word → STT → sentinel
+- [ ] Kokoro-82M TTS integration (voice out)
+- [ ] Voice loop: hear → parse → act → speak
+- [ ] Speaker ID (wespeaker ECAPA)
+- [ ] Pull Qwen3-VL-8B + YOLO26-N (vision)
 - [ ] Smithay compositor on spare TTY (owns the screen)
 - [ ] Verbs become Wayland surfaces (mpv, browser as verb targets)
 - [ ] Boot ownership — llminux.service on tty1, replace SDDM
 - [ ] Upgrade brain to Qwen3.6-35B-A3B (MTP heads, successor model)
-- [ ] Pull Whisper-v3-turbo + openWakeWord + Silero VAD (hearing)
-- [ ] Pull Qwen3-VL-8B + YOLO26-N (vision)
-- [ ] Kokoro-82M TTS integration (voice)
-- [ ] Speaker ID (wespeaker ECAPA)
 - [ ] Proprioceptive daemons (accel, light, BT, thermal)
 
 ## Roadmap
