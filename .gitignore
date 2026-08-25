@@ -1,1 +1,4 @@
 /target
+*.onnx
+voices-*.bin
+__pycache__/

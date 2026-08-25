@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""LLMINUX ear daemon — microphone → STT → sentinel pipeline.
+"""LLMINUX ear daemon — hear → parse → act → speak.
 
-Captures audio, detects speech via energy threshold, transcribes via
-Whisper-v3-turbo on NPU (FLM --asr), feeds transcriptions to the sentinel.
+Full voice loop: mic → energy VAD → Whisper STT (NPU) → sentinel parse →
+verb execution → Kokoro TTS response.
 
-Requires: flm.service running with --asr 1, whisper-v3:turbo pulled.
+Requires: flm.service running with --asr 1, whisper-v3:turbo pulled,
+kokoro-v1.0.onnx + voices-v1.0.bin in project dir.
 """
 
 import io
 import json
+import os
 import re
 import subprocess
 import sys
@@ -20,6 +22,7 @@ from pathlib import Path
 
 import numpy as np
 import sounddevice as sd
+from kokoro_onnx import Kokoro
 
 SAMPLE_RATE = 16000
 CHANNELS = 1
@@ -36,6 +39,12 @@ SENTINEL_URL = f"{FLM_URL}/api/chat"
 SENTINEL_MODEL = "qwen3:1.7b"
 
 PROMPT_FILE = Path(__file__).parent / "sentinel_prompt.txt"
+MODEL_DIR = Path(__file__).parent
+KOKORO_MODEL = MODEL_DIR / "kokoro-v1.0.onnx"
+KOKORO_VOICES = MODEL_DIR / "voices-v1.0.bin"
+KOKORO_VOICE = "af_heart"
+KOKORO_SPEED = 1.0
+SPEAK_COOLDOWN_S = 1.0
 
 WHISPER_NOISE = {"", "you", "thank you", "thanks", "bye", "okay",
                  "thank you.", "thanks.", "bye.", "you."}
@@ -130,8 +139,61 @@ def ask_sentinel(text, system_prompt):
     return parsed, latency
 
 
+def execute_verb(verb):
+    name = verb.get("verb", "")
+    args = verb.get("args", {})
+
+    if name == "run_command":
+        cmd = args.get("cmd", "")
+        if not cmd:
+            return "No command specified."
+        try:
+            r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)
+            out = (r.stdout.strip() or r.stderr.strip() or "Done.")
+            return out[:500]
+        except subprocess.TimeoutExpired:
+            return "Command timed out."
+
+    if name == "show_text":
+        return args.get("text", "")
+
+    if name == "disk_usage":
+        r = subprocess.run(["df", "-h", "--output=size,avail,pcent", "/"],
+                           capture_output=True, text=True)
+        lines = [l for l in r.stdout.strip().split("\n") if not l.strip().startswith("Size")]
+        if lines:
+            parts = lines[0].split()
+            if len(parts) >= 3:
+                return f"{parts[1]} free of {parts[0]}, {parts[2]} used."
+        return r.stdout.strip()[:300]
+
+    if name == "list_dir":
+        path = os.path.expanduser(args.get("path", "."))
+        try:
+            entries = sorted(os.listdir(path))[:20]
+            return ", ".join(entries) if entries else "Empty directory."
+        except OSError as e:
+            return str(e)
+
+    if name == "open_file":
+        path = os.path.expanduser(args.get("path", ""))
+        try:
+            text = Path(path).read_text()[:500]
+            return text or "Empty file."
+        except OSError as e:
+            return str(e)
+
+    if name == "escalate":
+        return f"Escalating: {args.get('task', 'unknown task')}. GPU brain not wired yet."
+
+    if name == "play_media":
+        return f"Media playback not wired yet: {args.get('query', '')}"
+
+    return f"Unknown verb: {name}"
+
+
 class Ear:
-    def __init__(self, threshold=SPEECH_THRESHOLD, device=None):
+    def __init__(self, threshold=SPEECH_THRESHOLD, device=None, voice=KOKORO_VOICE):
         self.threshold = threshold
         self.device = device
         self.system_prompt = PROMPT_FILE.read_text().strip()
@@ -143,6 +205,8 @@ class Ear:
         self.min_blocks = int(MIN_SPEECH_S * SAMPLE_RATE / BLOCK_SIZE)
         self.max_blocks = int(MAX_SPEECH_S * SAMPLE_RATE / BLOCK_SIZE)
         self.processing = False
+        self.voice = voice
+        self.kokoro = Kokoro(str(KOKORO_MODEL), str(KOKORO_VOICES))
 
     def callback(self, indata, frames, time_info, status):
         if status:
@@ -174,6 +238,26 @@ class Ear:
                 else:
                     self.buffer = []
 
+    def speak(self, text):
+        if not text or not text.strip():
+            return
+        utterance = text.strip()[:300]
+        try:
+            t0 = time.monotonic()
+            samples, sr = self.kokoro.create(utterance, voice=self.voice, speed=KOKORO_SPEED)
+            tts_ms = int((time.monotonic() - t0) * 1000)
+            duration = len(samples) / sr
+            print(f"\033[35m  speak:\033[0m \"{utterance[:60]}\" ({duration:.1f}s, {tts_ms}ms gen)")
+            pad = np.zeros(int(sr * 0.05), dtype=samples.dtype)
+            samples = np.concatenate([pad, samples])
+            sd.play(samples, sr)
+            sd.wait()
+        except Exception as e:
+            print(f"  \033[31m✗ tts: {e}, falling back to espeak\033[0m", file=sys.stderr)
+            subprocess.run(["espeak-ng", "-v", "en-us", "-s", "140", "-p", "30", utterance],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(SPEAK_COOLDOWN_S)
+
     def _process(self, audio):
         try:
             duration = len(audio) / SAMPLE_RATE
@@ -194,6 +278,10 @@ class Ear:
             verb_str = verb.get("verb", "?")
             args_str = json.dumps(verb.get("args", {}))
             print(f"\033[32m  verb:\033[0m {verb_str} {args_str} ({sentinel_ms}ms)")
+
+            result = execute_verb(verb)
+            print(f"\033[36m  result:\033[0m {result[:80]}")
+            self.speak(result)
         except Exception as e:
             print(f"  \033[31m✗ {e}\033[0m", file=sys.stderr)
         finally:
@@ -208,7 +296,9 @@ class Ear:
         print(f"  vad: energy threshold {self.threshold}")
         print(f"  stt: whisper-v3:turbo (NPU)")
         print(f"  sentinel: {SENTINEL_MODEL} (NPU)")
+        print(f"  tts: kokoro-82m ({self.voice})")
         print()
+        self.speak("Ears online.")
         print("Listening...\n")
 
         with sd.InputStream(
@@ -226,17 +316,26 @@ class Ear:
                 print("\nStopped.")
 
 
-def say(text):
+def say(text, kokoro=None, voice=KOKORO_VOICE):
+    if kokoro:
+        try:
+            samples, sr = kokoro.create(text, voice=voice, speed=KOKORO_SPEED)
+            sd.play(samples, sr)
+            sd.wait()
+            return
+        except Exception:
+            pass
     subprocess.run(["espeak-ng", "-v", "en-us", "-s", "140", "-p", "30", text],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 def calibrate(device=None):
+    kokoro = Kokoro(str(KOKORO_MODEL), str(KOKORO_VOICES))
     samples = []
     def cb(indata, frames, time_info, status):
         samples.append(rms(indata[:, 0]))
 
-    say("Stay quiet.")
+    say("Stay quiet.", kokoro)
     print("Stay quiet for 3 seconds...")
     with sd.InputStream(device=device, samplerate=SAMPLE_RATE, channels=1,
                         dtype="float32", blocksize=BLOCK_SIZE, callback=cb):
@@ -245,7 +344,7 @@ def calibrate(device=None):
     noise_peak = np.max(samples)
 
     print(f"  noise floor: {noise:.4f} (peak {noise_peak:.4f})")
-    say("Speak now.")
+    say("Speak now.", kokoro)
     print("\nSpeak normally for 3 seconds...")
     samples.clear()
     with sd.InputStream(device=device, samplerate=SAMPLE_RATE, channels=1,
@@ -254,7 +353,7 @@ def calibrate(device=None):
     speech = np.mean(samples)
     speech_peak = np.max(samples)
 
-    say("Done.")
+    say("Done.", kokoro)
     print(f"  speech level: {speech:.4f} (peak {speech_peak:.4f})")
     print(f"  ratio: {speech / max(noise, 1e-6):.1f}x")
     threshold = noise_peak * 2.5
@@ -281,13 +380,18 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser(description="LLMINUX ear daemon")
     p.add_argument("--threshold", type=float, default=SPEECH_THRESHOLD)
     p.add_argument("--device", type=int, default=None)
+    p.add_argument("--voice", default=KOKORO_VOICE, help="Kokoro voice (default: af_heart)")
     p.add_argument("--calibrate", action="store_true")
     p.add_argument("--test", action="store_true", help="Record 4s and transcribe once")
+    p.add_argument("--say", type=str, default=None, help="Speak a phrase and exit")
     args = p.parse_args()
 
-    if args.calibrate:
+    if args.say:
+        kokoro = Kokoro(str(KOKORO_MODEL), str(KOKORO_VOICES))
+        say(args.say, kokoro, args.voice)
+    elif args.calibrate:
         calibrate(args.device)
     elif args.test:
         test_once(args.device)
     else:
-        Ear(threshold=args.threshold, device=args.device).run()
+        Ear(threshold=args.threshold, device=args.device, voice=args.voice).run()
