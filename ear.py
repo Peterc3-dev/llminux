@@ -26,7 +26,7 @@ CHANNELS = 1
 BLOCK_SIZE = 1600  # 100ms at 16kHz
 
 SPEECH_THRESHOLD = 0.015  # RMS float32, tune with --calibrate
-SPEECH_PAD_S = 0.4
+SPEECH_PAD_S = 0.8
 MIN_SPEECH_S = 0.5
 MAX_SPEECH_S = 15
 
@@ -200,8 +200,8 @@ class Ear:
             self.processing = False
 
     def run(self):
-        dev_id = self.device if self.device is not None else sd.default.device[0]
-        dev_info = sd.query_devices(dev_id, "input")
+        dev_id = self.device
+        dev_info = sd.query_devices(dev_id, "input") if dev_id is not None else sd.query_devices(kind="input")
         dev_name = dev_info["name"]
         print("\033[32mLLMINUX ear daemon\033[0m")
         print(f"  mic: {dev_name} ({SAMPLE_RATE}Hz mono)")
@@ -226,11 +226,17 @@ class Ear:
                 print("\nStopped.")
 
 
+def say(text):
+    subprocess.run(["espeak-ng", "-v", "en-us", "-s", "140", "-p", "30", text],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
 def calibrate(device=None):
     samples = []
     def cb(indata, frames, time_info, status):
         samples.append(rms(indata[:, 0]))
 
+    say("Stay quiet.")
     print("Stay quiet for 3 seconds...")
     with sd.InputStream(device=device, samplerate=SAMPLE_RATE, channels=1,
                         dtype="float32", blocksize=BLOCK_SIZE, callback=cb):
@@ -239,6 +245,7 @@ def calibrate(device=None):
     noise_peak = np.max(samples)
 
     print(f"  noise floor: {noise:.4f} (peak {noise_peak:.4f})")
+    say("Speak now.")
     print("\nSpeak normally for 3 seconds...")
     samples.clear()
     with sd.InputStream(device=device, samplerate=SAMPLE_RATE, channels=1,
@@ -247,6 +254,7 @@ def calibrate(device=None):
     speech = np.mean(samples)
     speech_peak = np.max(samples)
 
+    say("Done.")
     print(f"  speech level: {speech:.4f} (peak {speech_peak:.4f})")
     print(f"  ratio: {speech / max(noise, 1e-6):.1f}x")
     threshold = noise_peak * 2.5
