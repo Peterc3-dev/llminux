@@ -41,6 +41,17 @@ WHISPER_NOISE = {"", "you", "thank you", "thanks", "bye", "okay",
                  "thank you.", "thanks.", "bye.", "you."}
 
 
+def is_hallucination(text):
+    words = text.strip().split()
+    if len(words) < 4:
+        return False
+    chunks = [" ".join(words[i:i+2]) for i in range(len(words) - 1)]
+    if not chunks:
+        return False
+    most_common = max(set(chunks), key=chunks.count)
+    return chunks.count(most_common) / len(chunks) > 0.5
+
+
 def rms(block):
     return float(np.sqrt(np.mean(block.astype(np.float32) ** 2)))
 
@@ -173,8 +184,8 @@ class Ear:
             text = transcribe(wav)
             stt_ms = int((time.monotonic() - t0) * 1000)
 
-            if text.strip().lower() in WHISPER_NOISE:
-                print(f"  \033[90m○ noise: '{text}' ({stt_ms}ms)\033[0m", file=sys.stderr)
+            if text.strip().lower() in WHISPER_NOISE or is_hallucination(text):
+                print(f"  \033[90m○ noise/hallucination: '{text[:40]}' ({stt_ms}ms)\033[0m", file=sys.stderr)
                 return
 
             print(f"\033[33m  heard:\033[0m \"{text}\" ({stt_ms}ms)")
