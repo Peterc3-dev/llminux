@@ -42,12 +42,80 @@ PROMPT_FILE = Path(__file__).parent / "sentinel_prompt.txt"
 MODEL_DIR = Path(__file__).parent
 KOKORO_MODEL = MODEL_DIR / "kokoro-v1.0.onnx"
 KOKORO_VOICES = MODEL_DIR / "voices-v1.0.bin"
-KOKORO_VOICE = "af_heart"
-KOKORO_SPEED = 1.0
-SPEAK_COOLDOWN_S = 1.0
+KOKORO_VOICE = "af_nova"
+KOKORO_SPEED = 0.85
+SPEAK_COOLDOWN_S = 0.2
 
 WHISPER_NOISE = {"", "you", "thank you", "thanks", "bye", "okay",
                  "thank you.", "thanks.", "bye.", "you."}
+
+MONTHS = {"Jan": "January", "Feb": "February", "Mar": "March", "Apr": "April",
+          "May": "May", "Jun": "June", "Jul": "July", "Aug": "August",
+          "Sep": "September", "Oct": "October", "Nov": "November", "Dec": "December"}
+DAYS = {"Mon": "Monday", "Tue": "Tuesday", "Wed": "Wednesday", "Thu": "Thursday",
+        "Fri": "Friday", "Sat": "Saturday", "Sun": "Sunday"}
+
+
+ONES = ["", "one", "two", "three", "four", "five", "six", "seven",
+        "eight", "nine", "ten", "eleven", "twelve", "thirteen", "fourteen",
+        "fifteen", "sixteen", "seventeen", "eighteen", "nineteen"]
+TENS = ["", "", "twenty", "thirty", "forty", "fifty"]
+ORDINALS = {1: "first", 2: "second", 3: "third", 5: "fifth", 8: "eighth",
+            9: "ninth", 12: "twelfth", 20: "twentieth", 30: "thirtieth"}
+
+
+def num_to_words(n):
+    if n < 20:
+        return ONES[n]
+    if n < 60:
+        t, o = divmod(n, 10)
+        return TENS[t] + (" " + ONES[o] if o else "")
+    return str(n)
+
+
+def ordinal(n):
+    if n in ORDINALS:
+        return ORDINALS[n]
+    if n < 20:
+        return ONES[n] + "th"
+    t, o = divmod(n, 10)
+    if o == 0:
+        return ORDINALS.get(n, TENS[t] + "ieth")
+    return TENS[t] + " " + ordinal(o)
+
+
+def speakable(text):
+    s = text.strip()
+    m = re.match(r"^(Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d+)\s+(\d{1,2}):(\d{2}):\d{2}\s+(AM|PM)?\s*(\w+)?\s*(\d{4})?", s)
+    if m:
+        day = DAYS.get(m.group(1), m.group(1))
+        month = MONTHS.get(m.group(2), m.group(2))
+        date_n = int(m.group(3))
+        hour = int(m.group(4))
+        minute = int(m.group(5))
+        ampm = m.group(6) or ""
+        if not ampm:
+            ampm = "AM" if hour < 12 else "PM"
+            if hour > 12: hour -= 12
+            if hour == 0: hour = 12
+        hour_w = num_to_words(hour)
+        if minute == 0:
+            time_str = f"{hour_w} {ampm}"
+        else:
+            min_w = num_to_words(minute)
+            if minute < 10:
+                min_w = "oh " + min_w
+            time_str = f"{hour_w} {min_w} {ampm}"
+        date_w = ordinal(date_n)
+        return f"It's {time_str} on {day}, {month} {date_w}."
+    s = re.sub(r"\b(\d+)%", lambda m: num_to_words(int(m.group(1))) + " percent", s)
+    s = re.sub(r"\b(\d+)G\b", lambda m: num_to_words(int(m.group(1))) + " gig", s)
+    s = re.sub(r"\b(\d+)M\b", lambda m: num_to_words(int(m.group(1))) + " meg", s)
+    s = re.sub(r"\b(\d+)\b", lambda m: num_to_words(int(m.group(1))) if int(m.group(1)) < 60 else m.group(0), s)
+    lines = s.split("\n")
+    if len(lines) > 5:
+        s = "\n".join(lines[:5])
+    return s
 
 
 def is_hallucination(text):
@@ -205,12 +273,15 @@ class Ear:
         self.min_blocks = int(MIN_SPEECH_S * SAMPLE_RATE / BLOCK_SIZE)
         self.max_blocks = int(MAX_SPEECH_S * SAMPLE_RATE / BLOCK_SIZE)
         self.processing = False
+        self.speaking = False
         self.voice = voice
         self.kokoro = Kokoro(str(KOKORO_MODEL), str(KOKORO_VOICES))
 
     def callback(self, indata, frames, time_info, status):
         if status:
             print(f"  audio: {status}", file=sys.stderr)
+        if self.speaking:
+            return
         block = indata[:, 0].copy()
         energy = rms(block)
         is_speech = energy > self.threshold
@@ -238,25 +309,41 @@ class Ear:
                 else:
                     self.buffer = []
 
+    def _mute_mic(self, mute):
+        subprocess.run(["pactl", "set-source-mute", "@DEFAULT_SOURCE@",
+                        "1" if mute else "0"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
     def speak(self, text):
         if not text or not text.strip():
             return
         utterance = text.strip()[:300]
+        self.speaking = True
+        self._mute_mic(True)
         try:
             t0 = time.monotonic()
             samples, sr = self.kokoro.create(utterance, voice=self.voice, speed=KOKORO_SPEED)
             tts_ms = int((time.monotonic() - t0) * 1000)
+            word_count = len(utterance.split())
+            max_dur = max(2.0, word_count * 0.45 / KOKORO_SPEED)
+            max_samples = int(max_dur * sr)
+            if len(samples) > max_samples:
+                samples = samples[:max_samples]
             duration = len(samples) / sr
             print(f"\033[35m  speak:\033[0m \"{utterance[:60]}\" ({duration:.1f}s, {tts_ms}ms gen)")
-            pad = np.zeros(int(sr * 0.05), dtype=samples.dtype)
-            samples = np.concatenate([pad, samples])
-            sd.play(samples, sr)
-            sd.wait()
+            wav = to_wav(samples, sr)
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as f:
+                f.write(wav)
+                f.flush()
+                subprocess.run(["aplay", "-q", f.name], timeout=15)
         except Exception as e:
             print(f"  \033[31m✗ tts: {e}, falling back to espeak\033[0m", file=sys.stderr)
             subprocess.run(["espeak-ng", "-v", "en-us", "-s", "140", "-p", "30", utterance],
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        time.sleep(SPEAK_COOLDOWN_S)
+        finally:
+            time.sleep(SPEAK_COOLDOWN_S)
+            self._mute_mic(False)
+            self.speaking = False
 
     def _process(self, audio):
         try:
@@ -280,14 +367,25 @@ class Ear:
             print(f"\033[32m  verb:\033[0m {verb_str} {args_str} ({sentinel_ms}ms)")
 
             result = execute_verb(verb)
+            spoken = speakable(result)
             print(f"\033[36m  result:\033[0m {result[:80]}")
-            self.speak(result)
+            self.speak(spoken)
         except Exception as e:
             print(f"  \033[31m✗ {e}\033[0m", file=sys.stderr)
         finally:
             self.processing = False
 
     def run(self):
+        lockfile = Path("/tmp/llminux-ear.pid")
+        if lockfile.exists():
+            old_pid = lockfile.read_text().strip()
+            if Path(f"/proc/{old_pid}").exists():
+                print(f"  \033[31m✗ ear daemon already running (pid {old_pid})\033[0m")
+                sys.exit(1)
+        lockfile.write_text(str(os.getpid()))
+        import atexit
+        atexit.register(lambda: lockfile.unlink(missing_ok=True))
+
         dev_id = self.device
         dev_info = sd.query_devices(dev_id, "input") if dev_id is not None else sd.query_devices(kind="input")
         dev_name = dev_info["name"]
@@ -380,7 +478,7 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser(description="LLMINUX ear daemon")
     p.add_argument("--threshold", type=float, default=SPEECH_THRESHOLD)
     p.add_argument("--device", type=int, default=None)
-    p.add_argument("--voice", default=KOKORO_VOICE, help="Kokoro voice (default: af_heart)")
+    p.add_argument("--voice", default=KOKORO_VOICE, help="Kokoro voice (default: af_nova)")
     p.add_argument("--calibrate", action="store_true")
     p.add_argument("--test", action="store_true", help="Record 4s and transcribe once")
     p.add_argument("--say", type=str, default=None, help="Speak a phrase and exit")
