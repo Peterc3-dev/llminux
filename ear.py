@@ -41,11 +41,26 @@ TRANSCRIBE_URL = f"{FLM_URL}/v1/audio/transcriptions"
 SENTINEL_URL = f"{FLM_URL}/api/chat"
 SENTINEL_MODEL = "qwen3:1.7b"
 
+# GPU brain: llama-server (Vulkan) from llama-qwen38-27b.service, OpenAI-compatible.
+BRAIN_URL = "http://localhost:8090/v1/chat/completions"
+BRAIN_TIMEOUT_S = 90
+BRAIN_SYSTEM = ("You are Phos, the voice of LLMINUX, talking to Boo. Answer in plain spoken "
+                "English: at most three short sentences, no lists, no markdown, and write "
+                "every number as words.")
+
 PROMPT_FILE = Path(__file__).parent / "sentinel_prompt.txt"
 MODEL_DIR = Path(__file__).parent
 KOKORO_MODEL = MODEL_DIR / "kokoro-v1.0.onnx"
 KOKORO_VOICES = MODEL_DIR / "voices-v1.0.bin"
 KOKORO_VOICE = "af_nova"
+
+# openWakeWord keyword spotter (CPU). Trained by wake/train_november.py. If the model
+# file is missing the daemon falls back to text matching on the Whisper transcript.
+WAKE_MODEL = MODEL_DIR / "november.onnx"
+WAKE_SCORE = 0.8          # spotter threshold; sweep: 2/798 synthetic near-miss negatives at 0.8, 5 at 0.5
+WAKE_FRAME = 1280         # 80 ms @ 16 kHz, openWakeWord's native frame
+WAKE_HOT_S = 6.0          # after a hit, the next capture within this window is a command
+WAKE_PATIENCE = 2         # consecutive frames over threshold before arming (rejects spikes)
 KOKORO_SPEED_LO = 0.65
 KOKORO_SPEED_HI = 0.9
 SPEAK_COOLDOWN_S = 0.2
@@ -348,6 +363,47 @@ def ask_sentinel(text, system_prompt):
     return parsed, latency
 
 
+def ask_brain(task):
+    """Send an escalated task to the GPU brain. Returns spoken-ready text or None."""
+    payload = json.dumps({
+        "model": "local",
+        "messages": [{"role": "system", "content": BRAIN_SYSTEM},
+                     {"role": "user", "content": task}],
+        "max_tokens": 160,
+        "temperature": 0.6,
+        "stream": False,
+        "chat_template_kwargs": {"enable_thinking": False},
+    })
+    try:
+        r = subprocess.run(
+            ["curl", "-s", "--max-time", str(BRAIN_TIMEOUT_S), BRAIN_URL,
+             "-H", "Content-Type: application/json", "-d", payload],
+            capture_output=True, text=True, timeout=BRAIN_TIMEOUT_S + 5,
+        )
+    except subprocess.TimeoutExpired:
+        return None
+    if r.returncode != 0 or not r.stdout.strip():
+        return None
+    try:
+        resp = json.loads(r.stdout)
+        content = resp["choices"][0]["message"]["content"]
+    except (ValueError, KeyError, IndexError, TypeError):
+        return None
+    content = re.sub(r"<think>.*?</think>", "", content, flags=re.S).strip()
+    return content or None
+
+
+def trim_spoken(text, limit=280):
+    """Cut at a sentence boundary so speak()'s hard cap never splits a word."""
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    idx = max(cut.rfind(mark) for mark in (". ", "! ", "? "))
+    if idx > limit // 3:            # a sentence end, but not so early we lose most of it
+        return cut[:idx + 1]
+    return cut.rsplit(" ", 1)[0].rstrip(".!?,") + "."
+
+
 def execute_verb(verb):
     name = verb.get("verb", "")
     args = verb.get("args", {})
@@ -418,7 +474,13 @@ def execute_verb(verb):
         return f"Brightness set to {pct} percent."
 
     if name == "escalate":
-        return "I can't do that yet. Once the GPU brain is online, I'll handle it for you."
+        task = args.get("task", "").strip()
+        if not task:
+            return "I didn't catch what you wanted me to think about."
+        answer = ask_brain(task)
+        if answer is None:
+            return "The big brain isn't answering right now."
+        return trim_spoken(answer)
 
     if name == "play_media":
         return f"I can't play media yet. That's not wired up."
@@ -428,11 +490,11 @@ def execute_verb(verb):
 
 VERB_NARRATIONS = {
     "disk_usage": "Let me check your storage.",
-    "run_command": "I'm running that for you.",
+    "run_command": "Checking.",
     "list_dir": "I'll look through that directory.",
     "open_file": "I'm pulling up the file.",
     "set_brightness": "I'll adjust that for you.",
-    "escalate": "That's above me. I'm sending it to the big brain.",
+    "escalate": "That needs the big brain. Give me a few seconds.",
     "play_media": "I'm firing up media.",
 }
 
@@ -458,8 +520,34 @@ class Ear:
         self.processing = False
         self.speaking = False
         self.awaiting_command = False
+        self.wake_hot_until = 0.0
         self.voice = voice
         self.kokoro = Kokoro(str(KOKORO_MODEL), str(KOKORO_VOICES))
+        self.oww = None
+        self.oww_buf = np.zeros(0, dtype=np.int16)
+        self.oww_streak = 0
+        if WAKE_MODEL.exists():
+            try:
+                from openwakeword.model import Model as OWWModel
+                self.oww = OWWModel(wakeword_models=[str(WAKE_MODEL)], inference_framework="onnx")
+            except Exception as e:
+                print(f"  \033[31m✗ wake model failed to load ({e}); text matching only\033[0m", file=sys.stderr)
+
+    def _spot_wake(self, block):
+        """Feed 80 ms frames to openWakeWord; arm awaiting_command on a hit."""
+        self.oww_buf = np.concatenate([self.oww_buf, (np.clip(block, -1, 1) * 32767).astype(np.int16)])
+        while len(self.oww_buf) >= WAKE_FRAME:
+            frame, self.oww_buf = self.oww_buf[:WAKE_FRAME], self.oww_buf[WAKE_FRAME:]
+            scores = self.oww.predict(frame)
+            score = max(scores.values()) if scores else 0.0
+            self.oww_streak = self.oww_streak + 1 if score >= WAKE_SCORE else 0
+            if self.oww_streak >= WAKE_PATIENCE and not self.awaiting_command:
+                self.oww_streak = 0
+                self.awaiting_command = True
+                self.wake_hot_until = time.monotonic() + WAKE_HOT_S
+                # No oww.reset() here: it re-embeds 4 s of noise (~53 ms) on the
+                # real-time audio thread. The awaiting_command gate prevents re-arming.
+                print(f"\033[33m  wake:\033[0m spotted (score {score:.2f})", file=sys.stderr)
 
     def callback(self, indata, frames, time_info, status):
         if status:
@@ -469,6 +557,17 @@ class Ear:
         block = indata[:, 0].copy()
         energy = rms(block)
         is_speech = energy > self.threshold
+        if self.oww is not None:
+            try:
+                self._spot_wake(block)
+            except Exception as e:
+                print(f"  \033[31m✗ wake spotter: {e}\033[0m", file=sys.stderr)
+                self.oww = None
+        if (self.awaiting_command and self.wake_hot_until and not self.recording
+                and not self.processing and time.monotonic() > self.wake_hot_until):
+            self.awaiting_command = False
+            self.wake_hot_until = 0.0
+            print("  \033[90m○ wake window expired\033[0m", file=sys.stderr)
         if not self.recording:
             self.pre_roll.append(block)
 
@@ -568,8 +667,24 @@ class Ear:
 
             if self.awaiting_command:
                 self.awaiting_command = False
-                command = text.strip()
-                print(f"\033[33m  heard:\033[0m \"{command}\" ({stt_ms}ms)")
+                self.wake_hot_until = 0.0
+                stripped = strip_wake(text)
+                if stripped == "":
+                    # Bare "November" — acknowledge and keep listening for the command.
+                    print(f"\033[33m  wake:\033[0m acknowledged ({stt_ms}ms)  \033[90m← '{text.strip()[:50]}'\033[0m")
+                    self.speak("Hey Boo.")
+                    self.awaiting_command = True
+                    self.wake_hot_until = time.monotonic() + WAKE_HOT_S
+                    return
+                if stripped is not None:
+                    command = stripped
+                else:
+                    # Spotter heard the wake word but Whisper mangled it ("I remember, ...").
+                    # Drop a short leading fragment before the first comma.
+                    raw = text.strip()
+                    head, sep, tail = raw.partition(",")
+                    command = tail.strip() if sep and len(head.split()) <= 3 and tail.strip() else raw
+                print(f"\033[33m  heard:\033[0m \"{command}\" ({stt_ms}ms)  \033[90m← '{text.strip()[:50]}'\033[0m")
             else:
                 command = strip_wake(text)
                 if command is None:
@@ -620,7 +735,8 @@ class Ear:
         print(f"  stt: whisper-v3:turbo (NPU)")
         print(f"  sentinel: {SENTINEL_MODEL} (NPU)")
         print(f"  tts: kokoro-82m ({self.voice})")
-        print(f"  wake: \"November\" (say 'November, ...' — Phosphor/Foss also accepted)")
+        spotter = "openWakeWord spotter" if self.oww is not None else "text match only (no november.onnx)"
+        print(f"  wake: \"November\" — {spotter}")
         print()
         self.speak("Hey Boo. Getting things turned on.")
         self.speak("My voice is ready.")

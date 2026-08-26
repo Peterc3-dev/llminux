@@ -2,3 +2,6 @@
 *.onnx
 voices-*.bin
 __pycache__/
+
+# the trained wake-word spotter is small and ships with the repo
+!november.onnx
