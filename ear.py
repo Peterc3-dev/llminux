@@ -159,18 +159,31 @@ DAYS = {"Mon": "Monday", "Tue": "Tuesday", "Wed": "Wednesday", "Thu": "Thursday"
 ONES = ["zero", "one", "two", "three", "four", "five", "six", "seven",
         "eight", "nine", "ten", "eleven", "twelve", "thirteen", "fourteen",
         "fifteen", "sixteen", "seventeen", "eighteen", "nineteen"]
-TENS = ["", "", "twenty", "thirty", "forty", "fifty"]
+TENS = ["", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"]
 ORDINALS = {1: "first", 2: "second", 3: "third", 5: "fifth", 8: "eighth",
             9: "ninth", 12: "twelfth", 20: "twentieth", 30: "thirtieth"}
+SCALES = [(1_000_000_000, "billion"), (1_000_000, "million"), (1_000, "thousand")]
 
 
 def num_to_words(n):
+    """Integer -> English words. Kokoro loops on raw digits, so nothing may leak."""
+    if n < 0:
+        return "minus " + num_to_words(-n)
     if n < 20:
         return ONES[n]
-    if n < 60:
+    if n < 100:
         t, o = divmod(n, 10)
         return TENS[t] + (" " + ONES[o] if o else "")
-    return str(n)
+    if n < 1000:
+        h, r = divmod(n, 100)
+        return ONES[h] + " hundred" + (" " + num_to_words(r) if r else "")
+    for scale, name in SCALES:
+        if n >= scale:
+            q, r = divmod(n, scale)
+            if q >= 1000:
+                return "a very large number"
+            return num_to_words(q) + " " + name + (" " + num_to_words(r) if r else "")
+    return "a very large number"
 
 
 def ordinal(n):
@@ -209,7 +222,9 @@ def speakable(text):
     s = re.sub(r"\b(\d+)%", lambda m: num_to_words(int(m.group(1))) + " percent", s)
     s = re.sub(r"\b(\d+)G\b", lambda m: num_to_words(int(m.group(1))) + " gig", s)
     s = re.sub(r"\b(\d+)M\b", lambda m: num_to_words(int(m.group(1))) + " meg", s)
-    s = re.sub(r"\b(\d+)\b", lambda m: num_to_words(int(m.group(1))) if int(m.group(1)) < 60 else m.group(0), s)
+    # No \b: digits glued to letters ("gfx1150", "v3") must not leak to Kokoro either.
+    s = re.sub(r"(\d+)", lambda m: f" {num_to_words(int(m.group(1)))} ", s)
+    s = re.sub(r"[ \t]+", " ", s).strip()
     lines = s.split("\n")
     if len(lines) > 5:
         s = "\n".join(lines[:5])
