@@ -21,6 +21,7 @@ import wave
 from pathlib import Path
 
 import random
+from collections import deque
 import numpy as np
 import sounddevice as sd
 from kokoro_onnx import Kokoro
@@ -31,6 +32,7 @@ BLOCK_SIZE = 1600  # 100ms at 16kHz
 
 SPEECH_THRESHOLD = 0.015  # RMS float32, tune with --calibrate
 SPEECH_PAD_S = 0.8
+PRE_ROLL_S = 0.4
 MIN_SPEECH_S = 0.5
 MAX_SPEECH_S = 15
 
@@ -51,18 +53,65 @@ SPEAK_COOLDOWN_S = 0.2
 WHISPER_NOISE = {"", "you", "thank you", "thanks", "bye", "okay",
                  "thank you.", "thanks.", "bye.", "you."}
 
-WAKE_WORDS = ["phosphor", "phos", "fosse", "floss", "force", "foss", "boss"]
+WAKE_WORDS = ["phosphor", "bosphor", "phos", "fosse", "floss", "force", "false", "foss", "boss"]
+WAKE_FILLER = {"hey", "yo", "hi", "okay", "ok", "uh", "um", "so"}
+# Bone-conduction mic drops the /f/; Whisper splits or swaps it. Matched on letters only.
+WAKE_COLLAPSED = ["phosphor", "bosphor", "fosphor", "phosfor", "fosfor", "fasfor", "bosfor", "vosfor"]
+
+
+def _is_wake_filler(text):
+    """True if text is empty, filler words, or just repeated wake words."""
+    cleaned = text.lower().rstrip(",.!? ")
+    if not cleaned:
+        return True
+    words = re.split(r"[,.\s!?]+", cleaned)
+    wake_set = set(WAKE_WORDS) | WAKE_FILLER
+    return all(w in wake_set for w in words if w)
+
+
+def _strip_collapsed(raw):
+    letters = re.sub(r"[^a-z]", "", raw.lower())
+    for alias in WAKE_COLLAPSED:
+        if not letters.startswith(alias):
+            continue
+        i, n = 0, 0
+        while i < len(raw) and n < len(alias):
+            if raw[i].isalpha():
+                n += 1
+            i += 1
+        if i < len(raw) and raw[i].isalpha():
+            continue
+        rest = raw[i:].lstrip(" ,.!?-")
+        return "" if _is_wake_filler(rest) else rest
+    return None
 
 
 def strip_wake(text):
-    lower = text.strip().lower()
+    raw = text.strip().lstrip("-–— ").strip()
+    lower = raw.lower()
     for w in WAKE_WORDS:
         if lower.startswith(w):
             after = lower[len(w):len(w)+1]
             if after and after not in " ,.!?":
                 continue
-            rest = text.strip()[len(w):].lstrip(" ,.")
-            return rest if rest else ""
+            rest = raw[len(w):].lstrip(" ,.")
+            if _is_wake_filler(rest):
+                return ""
+            return rest
+    collapsed = _strip_collapsed(raw)
+    if collapsed is not None:
+        return collapsed
+    stripped = lower.rstrip(" ,.!?")
+    for w in WAKE_WORDS:
+        if stripped.endswith(w):
+            before_idx = len(stripped) - len(w) - 1
+            before = stripped[before_idx] if before_idx >= 0 else ""
+            if before and before not in " ,.!?":
+                continue
+            rest = raw[:len(stripped)-len(w)].rstrip(" ,.!?")
+            if _is_wake_filler(rest):
+                return ""
+            return rest
     return None
 
 MONTHS = {"Jan": "January", "Feb": "February", "Mar": "March", "Apr": "April",
@@ -166,7 +215,10 @@ def transcribe(wav_bytes):
             ["curl", "-s", TRANSCRIBE_URL,
              "-F", f"file=@{f.name}",
              "-F", "model=whisper-v3:turbo",
-             "-F", "response_format=json"],
+             "-F", "response_format=json",
+             "-F", "language=en",
+             "-F", "temperature=0",
+             "-F", "prompt=Phosphor, what time is it? Phosphor, check my disk. Hey Phosphor."],
             capture_output=True, text=True, timeout=30,
         )
     if r.returncode != 0 or not r.stdout.strip():
@@ -327,6 +379,7 @@ class Ear:
         self.pad_blocks = int(SPEECH_PAD_S * SAMPLE_RATE / BLOCK_SIZE)
         self.min_blocks = int(MIN_SPEECH_S * SAMPLE_RATE / BLOCK_SIZE)
         self.max_blocks = int(MAX_SPEECH_S * SAMPLE_RATE / BLOCK_SIZE)
+        self.pre_roll = deque(maxlen=int(PRE_ROLL_S * SAMPLE_RATE / BLOCK_SIZE))
         self.processing = False
         self.speaking = False
         self.awaiting_command = False
@@ -341,13 +394,15 @@ class Ear:
         block = indata[:, 0].copy()
         energy = rms(block)
         is_speech = energy > self.threshold
+        if not self.recording:
+            self.pre_roll.append(block)
 
         if is_speech:
             self.silence_blocks = 0
             if not self.recording and not self.processing:
                 self.recording = True
                 self.speech_blocks = 0
-                self.buffer = []
+                self.buffer = list(self.pre_roll)
                 print("  \033[33m◉ speech\033[0m", file=sys.stderr, end="\r")
             if self.recording:
                 self.buffer.append(block)
@@ -420,10 +475,15 @@ class Ear:
             text = transcribe(wav)
             stt_ms = int((time.monotonic() - t0) * 1000)
 
-            if text.strip().lower() in WHISPER_NOISE or is_hallucination(text):
-                print(f"  \033[90m○ noise/hallucination: '{text[:40]}' ({stt_ms}ms)\033[0m", file=sys.stderr)
+            if text.strip().lower() in WHISPER_NOISE:
+                print(f"  \033[90m○ noise: '{text[:40]}' ({stt_ms}ms)\033[0m", file=sys.stderr)
                 if self.awaiting_command:
                     self.awaiting_command = False
+                return
+
+            has_wake = strip_wake(text) is not None
+            if not has_wake and not self.awaiting_command and is_hallucination(text):
+                print(f"  \033[90m○ hallucination: '{text[:40]}' ({stt_ms}ms)\033[0m", file=sys.stderr)
                 return
 
             if self.awaiting_command:
@@ -480,7 +540,7 @@ class Ear:
         print(f"  stt: whisper-v3:turbo (NPU)")
         print(f"  sentinel: {SENTINEL_MODEL} (NPU)")
         print(f"  tts: kokoro-82m ({self.voice})")
-        print(f"  wake: \"Phos\" (say 'Phos, ...')")
+        print(f"  wake: \"Phosphor\" (say 'Phosphor, ...' — 'Foss' also accepted)")
         print()
         self.speak("Hey Boo. Getting things turned on.")
         self.speak("My voice feels good. Ready when you are.")
