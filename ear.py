@@ -53,22 +53,25 @@ SPEAK_COOLDOWN_S = 0.2
 WHISPER_NOISE = {"", "you", "thank you", "thanks", "bye", "okay",
                  "thank you.", "thanks.", "bye.", "you."}
 
-WAKE_WORDS = ["phosphorus", "phosphor", "bosphor", "phos", "fosse", "floss", "force", "false", "foss", "boss"]
+# Primary wake word is "November" — all voiced consonants, survives the bone-conduction
+# mic, and Whisper knows it. Phosphor-era non-word aliases kept; real English words
+# (false/force/floss/boss/foster/"power for") dropped — they were false-wake risks.
+WAKE_WORDS = ["november", "phosphorus", "phosphor", "bosphor", "phos", "foss"]
 WAKE_FILLER = {"hey", "yo", "hi", "okay", "ok", "uh", "um", "so"}
 # Whisper sometimes prepends a stray word before the wake word ("Any phosphorus?").
 LEAD_FILLER = WAKE_FILLER | {"any", "and", "a", "the", "oh", "well", "now", "it's", "its", "it", "if"}
 # Bone-conduction mic drops the /f/; Whisper splits or swaps it. Matched on letters only.
-WAKE_COLLAPSED = ["phosphorus", "phosphor", "bosphor", "fosphor", "phosfor", "fosfor", "fasfor", "bosfor", "vosfor"]
+WAKE_COLLAPSED = ["november", "phosphorus", "phosphor", "bosphor", "fosphor", "phosfor", "fosfor", "fasfor", "bosfor", "vosfor"]
 # Whisper buries the wake word behind invented lead-ins ("If it phosphates me, ...",
 # "It's a phosphorus and ..."). Any token with one of these roots inside the first
 # WAKE_SCAN_TOKENS is a wake — nothing phosph-shaped occurs in ordinary speech.
-WAKE_ROOTS = ("phosph", "bosph", "fosph", "fosfor", "fasfor", "bosfor", "vosfor")
+WAKE_ROOTS = ("novemb", "phosph", "bosph", "fosph", "fosfor", "fasfor", "bosfor", "vosfor")
 # Whisper rendered "Phosphor" as "Power for" sentence-initially. Real bigram, so only
 # accepted at the start or after address words ("more power for you" must not wake).
-WAKE_ROOTS_INITIAL = ("powerfor", "foster")
+WAKE_ROOTS_INITIAL = ()  # real-word Whisper renderings of "Phosphor"; none needed for November
 # Aliases accepted after an address word ("Hey, Foss ..."). Excludes force/false/floss
 # so "so force it" / "okay false alarm" don't wake.
-WEAK_AFTER_ADDRESS = {"phosphorus", "phosphor", "bosphor", "phos", "foss", "boss"}
+WEAK_AFTER_ADDRESS = {"november", "phosphorus", "phosphor", "bosphor", "phos", "foss"}
 WAKE_SCAN_TOKENS = 4
 
 
@@ -104,9 +107,9 @@ def _strip_wake_once(raw):
     for w in WAKE_WORDS:
         if lower.startswith(w):
             after = lower[len(w):len(w)+1]
-            if after and after not in " ,.!?":
+            if after and after not in " ,.!?'":
                 continue
-            rest = raw[len(w):].lstrip(" ,.!?-")
+            rest = re.sub(r"^'s\b", "", raw[len(w):]).lstrip(" ,.!?-")
             if _is_wake_filler(rest):
                 return ""
             return rest
@@ -120,7 +123,12 @@ def _strip_wake_once(raw):
             before = stripped[before_idx] if before_idx >= 0 else ""
             if before and before not in " ,.!?":
                 continue
-            rest = raw[:len(stripped)-len(w)].rstrip(" ,.!?")
+            head = raw[:len(stripped)-len(w)]
+            # "November" is a real month: sentence-final it only counts as a vocative
+            # ("what time is it, November?"), not date talk ("I was born in November").
+            if w == "november" and head.strip() and not head.rstrip().endswith((",", "?", "!", ".")):
+                continue
+            rest = head.rstrip(" ,.!?")
             if _is_wake_filler(rest):
                 return ""
             return rest
@@ -145,6 +153,13 @@ def strip_wake(text):
         initial_ok = i == 0 or all(
             re.sub(r"[^a-z]", "", t.lower()) in WAKE_FILLER for t in tokens[:i]
         )
+        # "November" is a real month: mid-sentence it only counts when everything before
+        # it is a Whisper lead-in ("It's November, ...") — never after content words
+        # ("the meeting is November 3rd").
+        if letters.startswith("novemb") and not (i == 0 or all(
+            re.sub(r"[^a-z']", "", t.lower()) in LEAD_FILLER for t in tokens[:i]
+        )):
+            continue
         # Strong roots are prefixes (phosphates/phosphorus); initial roots are real-word
         # fragments and must match the whole token ("fostering" must not wake).
         hit = letters.startswith(WAKE_ROOTS) or (initial_ok and letters in WAKE_ROOTS_INITIAL)
@@ -278,7 +293,7 @@ def transcribe(wav_bytes):
              "-F", "response_format=json",
              "-F", "language=en",
              "-F", "temperature=0",
-             "-F", "prompt=Phosphor, what time is it? Phosphor, check my disk. Hey Phosphor."],
+             "-F", "prompt=November, what time is it? November, check my disk. Hey November."],
             capture_output=True, text=True, timeout=30,
         )
     if r.returncode != 0 or not r.stdout.strip():
@@ -399,7 +414,7 @@ def execute_verb(verb):
             return f"Unknown brightness level: {level}"
         subprocess.run(["brightnessctl", "set", str(new)],
                        capture_output=True, timeout=5)
-        pct = int(new * 100 / max_b)
+        pct = round(new * 100 / max_b)
         return f"Brightness set to {pct} percent."
 
     if name == "escalate":
@@ -497,7 +512,9 @@ class Ear:
             samples, sr = self.kokoro.create(utterance, voice=self.voice, speed=speed)
             tts_ms = int((time.monotonic() - t0) * 1000)
             word_count = len(utterance.split())
-            max_dur = max(2.0, word_count * 0.45 / speed)
+            # Loop guard only — digits are already converted to words. Kokoro runs
+            # ~0.5 s/word at speed 1.0, so 0.6 leaves headroom at the slow end.
+            max_dur = max(2.0, word_count * 0.6 / speed)
             max_samples = int(max_dur * sr)
             if len(samples) > max_samples:
                 samples = samples[:max_samples]
@@ -515,7 +532,7 @@ class Ear:
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as f:
                 f.write(wav)
                 f.flush()
-                subprocess.run(["aplay", "-q", f.name], timeout=15)
+                subprocess.run(["aplay", "-q", f.name], timeout=max(15, int(duration) + 5))
         except Exception as e:
             print(f"  \033[31m✗ tts: {e}, falling back to espeak\033[0m", file=sys.stderr)
             subprocess.run(["espeak-ng", "-v", "en-us", "-s", "140", "-p", "30", utterance],
@@ -529,7 +546,10 @@ class Ear:
         try:
             duration = len(audio) / SAMPLE_RATE
             wav = to_wav(audio, SAMPLE_RATE)
-            print(f"  \033[36m◆ {duration:.1f}s captured, transcribing...\033[0m", file=sys.stderr)
+            mean_rms = rms(audio)
+            peak = float(np.abs(audio).max())
+            print(f"  \033[36m◆ {duration:.1f}s captured (rms {mean_rms:.4f}, peak {peak:.3f}), transcribing...\033[0m",
+                  file=sys.stderr)
 
             t0 = time.monotonic()
             text = transcribe(wav)
@@ -556,11 +576,11 @@ class Ear:
                     print(f"  \033[90m○ no wake word: '{text[:50]}' ({stt_ms}ms)\033[0m", file=sys.stderr)
                     return
                 if not command:
-                    print(f"\033[33m  wake:\033[0m acknowledged ({stt_ms}ms)")
+                    print(f"\033[33m  wake:\033[0m acknowledged ({stt_ms}ms)  \033[90m← '{text.strip()[:50]}'\033[0m")
                     self.speak("Hey Boo.")
                     self.awaiting_command = True
                     return
-                print(f"\033[33m  heard:\033[0m \"{command}\" ({stt_ms}ms)")
+                print(f"\033[33m  heard:\033[0m \"{command}\" ({stt_ms}ms)  \033[90m← '{text.strip()[:50]}'\033[0m")
 
             verb, sentinel_ms = ask_sentinel(command, self.system_prompt)
             verb_str = verb.get("verb", "?")
@@ -600,10 +620,10 @@ class Ear:
         print(f"  stt: whisper-v3:turbo (NPU)")
         print(f"  sentinel: {SENTINEL_MODEL} (NPU)")
         print(f"  tts: kokoro-82m ({self.voice})")
-        print(f"  wake: \"Phosphor\" (say 'Phosphor, ...' — 'Foss' also accepted)")
+        print(f"  wake: \"November\" (say 'November, ...' — Phosphor/Foss also accepted)")
         print()
         self.speak("Hey Boo. Getting things turned on.")
-        self.speak("My voice feels good. Ready when you are.")
+        self.speak("My voice is ready.")
         print("Listening...\n")
 
         with sd.InputStream(
