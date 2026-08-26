@@ -20,6 +20,7 @@ import time
 import wave
 from pathlib import Path
 
+import random
 import numpy as np
 import sounddevice as sd
 from kokoro_onnx import Kokoro
@@ -43,13 +44,14 @@ MODEL_DIR = Path(__file__).parent
 KOKORO_MODEL = MODEL_DIR / "kokoro-v1.0.onnx"
 KOKORO_VOICES = MODEL_DIR / "voices-v1.0.bin"
 KOKORO_VOICE = "af_nova"
-KOKORO_SPEED = 0.85
+KOKORO_SPEED_LO = 0.65
+KOKORO_SPEED_HI = 0.9
 SPEAK_COOLDOWN_S = 0.2
 
 WHISPER_NOISE = {"", "you", "thank you", "thanks", "bye", "okay",
                  "thank you.", "thanks.", "bye.", "you."}
 
-WAKE_WORDS = ["phosphor", "phos", "fosse", "floss", "force", "foss"]
+WAKE_WORDS = ["phosphor", "phos", "fosse", "floss", "force", "foss", "boss"]
 
 
 def strip_wake(text):
@@ -60,7 +62,7 @@ def strip_wake(text):
             if after and after not in " ,.!?":
                 continue
             rest = text.strip()[len(w):].lstrip(" ,.")
-            return rest if rest else None
+            return rest if rest else ""
     return None
 
 MONTHS = {"Jan": "January", "Feb": "February", "Mar": "March", "Apr": "April",
@@ -289,12 +291,28 @@ def execute_verb(verb):
         return f"Brightness set to {pct} percent."
 
     if name == "escalate":
-        return f"Escalating: {args.get('task', 'unknown task')}. GPU brain not wired yet."
+        return "I can't do that yet. Once the GPU brain is online, I'll handle it for you."
 
     if name == "play_media":
-        return f"Media playback not wired yet: {args.get('query', '')}"
+        return f"I can't play media yet. That's not wired up."
 
     return f"Unknown verb: {name}"
+
+
+VERB_NARRATIONS = {
+    "disk_usage": "Let me check your storage.",
+    "run_command": "I'm running that for you.",
+    "list_dir": "I'll look through that directory.",
+    "open_file": "I'm pulling up the file.",
+    "set_brightness": "I'll adjust that for you.",
+    "escalate": "That's above me. I'm sending it to the big brain.",
+    "play_media": "I'm firing up media.",
+}
+
+
+def _verb_narration(verb):
+    name = verb.get("verb", "")
+    return VERB_NARRATIONS.get(name)
 
 
 class Ear:
@@ -311,6 +329,7 @@ class Ear:
         self.max_blocks = int(MAX_SPEECH_S * SAMPLE_RATE / BLOCK_SIZE)
         self.processing = False
         self.speaking = False
+        self.awaiting_command = False
         self.voice = voice
         self.kokoro = Kokoro(str(KOKORO_MODEL), str(KOKORO_VOICES))
 
@@ -358,11 +377,12 @@ class Ear:
         self.speaking = True
         self._mute_mic(True)
         try:
+            speed = random.uniform(KOKORO_SPEED_LO, KOKORO_SPEED_HI)
             t0 = time.monotonic()
-            samples, sr = self.kokoro.create(utterance, voice=self.voice, speed=KOKORO_SPEED)
+            samples, sr = self.kokoro.create(utterance, voice=self.voice, speed=speed)
             tts_ms = int((time.monotonic() - t0) * 1000)
             word_count = len(utterance.split())
-            max_dur = max(2.0, word_count * 0.45 / KOKORO_SPEED)
+            max_dur = max(2.0, word_count * 0.45 / speed)
             max_samples = int(max_dur * sr)
             if len(samples) > max_samples:
                 samples = samples[:max_samples]
@@ -402,19 +422,34 @@ class Ear:
 
             if text.strip().lower() in WHISPER_NOISE or is_hallucination(text):
                 print(f"  \033[90m○ noise/hallucination: '{text[:40]}' ({stt_ms}ms)\033[0m", file=sys.stderr)
+                if self.awaiting_command:
+                    self.awaiting_command = False
                 return
 
-            command = strip_wake(text)
-            if command is None:
-                print(f"  \033[90m○ no wake word: '{text[:50]}' ({stt_ms}ms)\033[0m", file=sys.stderr)
-                return
-
-            print(f"\033[33m  heard:\033[0m \"{command}\" ({stt_ms}ms)")
+            if self.awaiting_command:
+                self.awaiting_command = False
+                command = text.strip()
+                print(f"\033[33m  heard:\033[0m \"{command}\" ({stt_ms}ms)")
+            else:
+                command = strip_wake(text)
+                if command is None:
+                    print(f"  \033[90m○ no wake word: '{text[:50]}' ({stt_ms}ms)\033[0m", file=sys.stderr)
+                    return
+                if not command:
+                    print(f"\033[33m  wake:\033[0m acknowledged ({stt_ms}ms)")
+                    self.speak("Hey Boo.")
+                    self.awaiting_command = True
+                    return
+                print(f"\033[33m  heard:\033[0m \"{command}\" ({stt_ms}ms)")
 
             verb, sentinel_ms = ask_sentinel(command, self.system_prompt)
             verb_str = verb.get("verb", "?")
             args_str = json.dumps(verb.get("args", {}))
             print(f"\033[32m  verb:\033[0m {verb_str} {args_str} ({sentinel_ms}ms)")
+
+            narration = _verb_narration(verb)
+            if narration:
+                self.speak(narration)
 
             result = execute_verb(verb)
             spoken = speakable(result)
@@ -447,7 +482,8 @@ class Ear:
         print(f"  tts: kokoro-82m ({self.voice})")
         print(f"  wake: \"Phos\" (say 'Phos, ...')")
         print()
-        self.speak("Foss, online.")
+        self.speak("Hey Boo. Getting things turned on.")
+        self.speak("My voice feels good. Ready when you are.")
         print("Listening...\n")
 
         with sd.InputStream(
@@ -468,7 +504,7 @@ class Ear:
 def say(text, kokoro=None, voice=KOKORO_VOICE):
     if kokoro:
         try:
-            samples, sr = kokoro.create(text, voice=voice, speed=KOKORO_SPEED)
+            samples, sr = kokoro.create(text, voice=voice, speed=random.uniform(KOKORO_SPEED_LO, KOKORO_SPEED_HI))
             sd.play(samples, sr)
             sd.wait()
             return
