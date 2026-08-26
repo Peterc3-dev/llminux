@@ -30,7 +30,7 @@ SAMPLE_RATE = 16000
 CHANNELS = 1
 BLOCK_SIZE = 1600  # 100ms at 16kHz
 
-SPEECH_THRESHOLD = 0.015  # RMS float32, tune with --calibrate
+SPEECH_THRESHOLD = 0.005  # RMS float32; Shokz noise floor ~0.0002, quiet speech ~0.009. Tune with --calibrate
 SPEECH_PAD_S = 0.8
 PRE_ROLL_S = 0.4
 MIN_SPEECH_S = 0.5
@@ -63,6 +63,9 @@ WAKE_COLLAPSED = ["phosphorus", "phosphor", "bosphor", "fosphor", "phosfor", "fo
 # "It's a phosphorus and ..."). Any token with one of these roots inside the first
 # WAKE_SCAN_TOKENS is a wake — nothing phosph-shaped occurs in ordinary speech.
 WAKE_ROOTS = ("phosph", "bosph", "fosph", "fosfor", "fasfor", "bosfor", "vosfor")
+# Whisper rendered "Phosphor" as "Power for" sentence-initially. Real bigram, so only
+# accepted at the start or after address words ("more power for you" must not wake).
+WAKE_ROOTS_INITIAL = ("powerfor", "foster")
 # Aliases accepted after an address word ("Hey, Foss ..."). Excludes force/false/floss
 # so "so force it" / "okay false alarm" don't wake.
 WEAK_AFTER_ADDRESS = {"phosphorus", "phosphor", "bosphor", "phos", "foss", "boss"}
@@ -139,12 +142,19 @@ def strip_wake(text):
         ):
             rest = " ".join(tokens[i + 1:]).lstrip(" ,.!?-")
             return "" if _is_wake_filler(rest) else rest
+        initial_ok = i == 0 or all(
+            re.sub(r"[^a-z]", "", t.lower()) in WAKE_FILLER for t in tokens[:i]
+        )
+        # Strong roots are prefixes (phosphates/phosphorus); initial roots are real-word
+        # fragments and must match the whole token ("fostering" must not wake).
+        hit = letters.startswith(WAKE_ROOTS) or (initial_ok and letters in WAKE_ROOTS_INITIAL)
         span = 1
-        if not letters.startswith(WAKE_ROOTS) and i + 1 < len(tokens):
+        if not hit and i + 1 < len(tokens):
             # Whisper splits the word: "Fa, sfor" -> "fasfor"
             letters = letters + re.sub(r"[^a-z]", "", tokens[i + 1].lower())
             span = 2
-        if letters.startswith(WAKE_ROOTS):
+            hit = letters.startswith(WAKE_ROOTS) or (initial_ok and letters in WAKE_ROOTS_INITIAL)
+        if hit:
             rest = " ".join(tokens[i + span:]).lstrip(" ,.!?-")
             return "" if _is_wake_filler(rest) else rest
     return None
