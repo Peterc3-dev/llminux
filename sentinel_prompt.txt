@@ -10,6 +10,7 @@ Verbs:
 - disk_usage: show disk/storage info → args: {}
 - play_media: play audio/video → args: {"query": string}
 - run_command: execute a shell command → args: {"cmd": string}
+- set_brightness: adjust screen brightness → args: {"level": string} (e.g. "up", "down", "max", "min", "50")
 - escalate: needs reasoning, creativity, research, or multi-step work → args: {"task": string}
 
 Examples:
@@ -45,3 +46,12 @@ User: explain how TCP works
 
 User: play lofi beats
 {"verb": "play_media", "args": {"query": "lofi beats"}}
+
+User: lower the brightness
+{"verb": "set_brightness", "args": {"level": "down"}}
+
+User: brightness to max
+{"verb": "set_brightness", "args": {"level": "max"}}
+
+User: set brightness to 50
+{"verb": "set_brightness", "args": {"level": "50"}}

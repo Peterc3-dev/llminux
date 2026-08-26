@@ -49,6 +49,20 @@ SPEAK_COOLDOWN_S = 0.2
 WHISPER_NOISE = {"", "you", "thank you", "thanks", "bye", "okay",
                  "thank you.", "thanks.", "bye.", "you."}
 
+WAKE_WORDS = ["phosphor", "phos", "fosse", "floss", "force", "foss"]
+
+
+def strip_wake(text):
+    lower = text.strip().lower()
+    for w in WAKE_WORDS:
+        if lower.startswith(w):
+            after = lower[len(w):len(w)+1]
+            if after and after not in " ,.!?":
+                continue
+            rest = text.strip()[len(w):].lstrip(" ,.")
+            return rest if rest else None
+    return None
+
 MONTHS = {"Jan": "January", "Feb": "February", "Mar": "March", "Apr": "April",
           "May": "May", "Jun": "June", "Jul": "July", "Aug": "August",
           "Sep": "September", "Oct": "October", "Nov": "November", "Dec": "December"}
@@ -249,6 +263,31 @@ def execute_verb(verb):
         except OSError as e:
             return str(e)
 
+    if name == "set_brightness":
+        bl = Path("/sys/class/backlight/amdgpu_bl1")
+        if not bl.exists():
+            return "No backlight device found."
+        max_b = int((bl / "max_brightness").read_text().strip())
+        cur = int((bl / "brightness").read_text().strip())
+        level = args.get("level", "").strip().lower()
+        step = max_b // 10
+        if level == "up":
+            new = min(cur + step, max_b)
+        elif level == "down":
+            new = max(cur - step, 0)
+        elif level == "max":
+            new = max_b
+        elif level == "min":
+            new = max_b // 20
+        elif level.isdigit():
+            new = max(max_b // 20, int(int(level) * max_b / 100))
+        else:
+            return f"Unknown brightness level: {level}"
+        subprocess.run(["brightnessctl", "set", str(new)],
+                       capture_output=True, timeout=5)
+        pct = int(new * 100 / max_b)
+        return f"Brightness set to {pct} percent."
+
     if name == "escalate":
         return f"Escalating: {args.get('task', 'unknown task')}. GPU brain not wired yet."
 
@@ -327,9 +366,17 @@ class Ear:
             max_samples = int(max_dur * sr)
             if len(samples) > max_samples:
                 samples = samples[:max_samples]
+            pad_s = np.zeros(int(sr * 0.05), dtype=samples.dtype)
+            pad_e = np.zeros(int(sr * 0.2), dtype=samples.dtype)
+            samples = np.concatenate([pad_s, samples, pad_e])
             duration = len(samples) / sr
             print(f"\033[35m  speak:\033[0m \"{utterance[:60]}\" ({duration:.1f}s, {tts_ms}ms gen)")
+            warm = to_wav(np.zeros(int(sr * 0.2), dtype=samples.dtype), sr)
             wav = to_wav(samples, sr)
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as fw:
+                fw.write(warm)
+                fw.flush()
+                subprocess.run(["aplay", "-q", fw.name], timeout=5)
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as f:
                 f.write(wav)
                 f.flush()
@@ -357,9 +404,14 @@ class Ear:
                 print(f"  \033[90m○ noise/hallucination: '{text[:40]}' ({stt_ms}ms)\033[0m", file=sys.stderr)
                 return
 
-            print(f"\033[33m  heard:\033[0m \"{text}\" ({stt_ms}ms)")
+            command = strip_wake(text)
+            if command is None:
+                print(f"  \033[90m○ no wake word: '{text[:50]}' ({stt_ms}ms)\033[0m", file=sys.stderr)
+                return
 
-            verb, sentinel_ms = ask_sentinel(text, self.system_prompt)
+            print(f"\033[33m  heard:\033[0m \"{command}\" ({stt_ms}ms)")
+
+            verb, sentinel_ms = ask_sentinel(command, self.system_prompt)
             verb_str = verb.get("verb", "?")
             args_str = json.dumps(verb.get("args", {}))
             print(f"\033[32m  verb:\033[0m {verb_str} {args_str} ({sentinel_ms}ms)")
@@ -393,8 +445,9 @@ class Ear:
         print(f"  stt: whisper-v3:turbo (NPU)")
         print(f"  sentinel: {SENTINEL_MODEL} (NPU)")
         print(f"  tts: kokoro-82m ({self.voice})")
+        print(f"  wake: \"Phos\" (say 'Phos, ...')")
         print()
-        self.speak("Ears online.")
+        self.speak("Foss, online.")
         print("Listening...\n")
 
         with sd.InputStream(
