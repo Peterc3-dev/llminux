@@ -53,10 +53,20 @@ SPEAK_COOLDOWN_S = 0.2
 WHISPER_NOISE = {"", "you", "thank you", "thanks", "bye", "okay",
                  "thank you.", "thanks.", "bye.", "you."}
 
-WAKE_WORDS = ["phosphor", "bosphor", "phos", "fosse", "floss", "force", "false", "foss", "boss"]
+WAKE_WORDS = ["phosphorus", "phosphor", "bosphor", "phos", "fosse", "floss", "force", "false", "foss", "boss"]
 WAKE_FILLER = {"hey", "yo", "hi", "okay", "ok", "uh", "um", "so"}
+# Whisper sometimes prepends a stray word before the wake word ("Any phosphorus?").
+LEAD_FILLER = WAKE_FILLER | {"any", "and", "a", "the", "oh", "well", "now", "it's", "its", "it", "if"}
 # Bone-conduction mic drops the /f/; Whisper splits or swaps it. Matched on letters only.
-WAKE_COLLAPSED = ["phosphor", "bosphor", "fosphor", "phosfor", "fosfor", "fasfor", "bosfor", "vosfor"]
+WAKE_COLLAPSED = ["phosphorus", "phosphor", "bosphor", "fosphor", "phosfor", "fosfor", "fasfor", "bosfor", "vosfor"]
+# Whisper buries the wake word behind invented lead-ins ("If it phosphates me, ...",
+# "It's a phosphorus and ..."). Any token with one of these roots inside the first
+# WAKE_SCAN_TOKENS is a wake — nothing phosph-shaped occurs in ordinary speech.
+WAKE_ROOTS = ("phosph", "bosph", "fosph", "fosfor", "fasfor", "bosfor", "vosfor")
+# Aliases accepted after an address word ("Hey, Foss ..."). Excludes force/false/floss
+# so "so force it" / "okay false alarm" don't wake.
+WEAK_AFTER_ADDRESS = {"phosphorus", "phosphor", "bosphor", "phos", "foss", "boss"}
+WAKE_SCAN_TOKENS = 4
 
 
 def _is_wake_filler(text):
@@ -65,7 +75,7 @@ def _is_wake_filler(text):
     if not cleaned:
         return True
     words = re.split(r"[,.\s!?]+", cleaned)
-    wake_set = set(WAKE_WORDS) | WAKE_FILLER
+    wake_set = set(WAKE_WORDS) | LEAD_FILLER
     return all(w in wake_set for w in words if w)
 
 
@@ -86,15 +96,14 @@ def _strip_collapsed(raw):
     return None
 
 
-def strip_wake(text):
-    raw = text.strip().lstrip("-–— ").strip()
+def _strip_wake_once(raw):
     lower = raw.lower()
     for w in WAKE_WORDS:
         if lower.startswith(w):
             after = lower[len(w):len(w)+1]
             if after and after not in " ,.!?":
                 continue
-            rest = raw[len(w):].lstrip(" ,.")
+            rest = raw[len(w):].lstrip(" ,.!?-")
             if _is_wake_filler(rest):
                 return ""
             return rest
@@ -112,6 +121,32 @@ def strip_wake(text):
             if _is_wake_filler(rest):
                 return ""
             return rest
+    return None
+
+
+def strip_wake(text):
+    raw = text.strip().lstrip("-–— ").strip()
+    result = _strip_wake_once(raw)
+    if result is not None:
+        return result
+    tokens = raw.split()
+    for i, tok in enumerate(tokens[:WAKE_SCAN_TOKENS]):
+        letters = re.sub(r"[^a-z]", "", tok.lower())
+        # Weak alias ("Foss"/"boss") is accepted mid-sentence only when every
+        # preceding token is an address word: "Hey, Foss, ..." yes; "the boss said" no.
+        if i > 0 and letters in WEAK_AFTER_ADDRESS and all(
+            re.sub(r"[^a-z]", "", t.lower()) in WAKE_FILLER for t in tokens[:i]
+        ):
+            rest = " ".join(tokens[i + 1:]).lstrip(" ,.!?-")
+            return "" if _is_wake_filler(rest) else rest
+        span = 1
+        if not letters.startswith(WAKE_ROOTS) and i + 1 < len(tokens):
+            # Whisper splits the word: "Fa, sfor" -> "fasfor"
+            letters = letters + re.sub(r"[^a-z]", "", tokens[i + 1].lower())
+            span = 2
+        if letters.startswith(WAKE_ROOTS):
+            rest = " ".join(tokens[i + span:]).lstrip(" ,.!?-")
+            return "" if _is_wake_filler(rest) else rest
     return None
 
 MONTHS = {"Jan": "January", "Feb": "February", "Mar": "March", "Apr": "April",
